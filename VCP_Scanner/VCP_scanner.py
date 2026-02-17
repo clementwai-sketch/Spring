@@ -1495,24 +1495,24 @@ if __name__ == "__main__":
     
     # Choose watchlist
     console.print("\n[bold cyan]Select watchlist to scan:[/bold cyan]")
-    console.print("  1. watchlists.json (default)")
-    console.print("  2. spx_qqq.json (S&P 500 + Nasdaq-100, ~508 tickers)")
-    console.print("  3. Japan_MSCI.json (MSCI Japan, 180 tickers)")
-    console.print("  4. HSI_HSTECH.json (Hong Kong Combined, 103 unique tickers)")
+    console.print("  1. Tech Sector (Global Tech Stocks)")
+    console.print("  2. US Markets (S&P 500 + Nasdaq-100, ~508 tickers)")
+    console.print("  3. Japan MSCI (MSCI Japan, 180 tickers)")
+    console.print("  4. Hong Kong (HSI + HSTECH Combined, 103 tickers)")
     choice = input("\nEnter choice (1-4) [default: 1]: ").strip() or "1"
     
     if choice == "2":
-        watchlist_file = 'spx_qqq.json'
+        watchlist_file = 'watchlists/us_stocks.json'
         console.print(f"[cyan]→ Using {watchlist_file} (SPX + QQQ)[/cyan]")
     elif choice == "3":
-        watchlist_file = 'Japan_MSCI.json'
+        watchlist_file = 'watchlists/japan_stocks.json'
         console.print(f"[cyan]→ Using {watchlist_file} (MSCI Japan, 180 tickers)[/cyan]")
     elif choice == "4":
-        watchlist_file = 'HSI_HSTECH.json'
-        console.print(f"[cyan]→ Using {watchlist_file} (Hong Kong Index + Tech Combined, 103 tickers)[/cyan]")
+        watchlist_file = 'watchlists/hk_stocks.json'
+        console.print(f"[cyan]→ Using {watchlist_file} (Hong Kong HSI + HSTECH, 103 tickers)[/cyan]")
     else:
-        watchlist_file = 'watchlists.json'
-        console.print(f"[cyan]→ Using {watchlist_file} (default)[/cyan]")
+        watchlist_file = 'watchlists/tech_sector.json'
+        console.print(f"[cyan]→ Using {watchlist_file} (Global Tech Stocks)[/cyan]")
     
     # Load watchlist from JSON
     tickers = load_watchlist_from_json(watchlist_file)
