@@ -1,0 +1,4 @@
+cache/
+Report/
+__pycache__/
+*.pyc
