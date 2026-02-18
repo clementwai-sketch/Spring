@@ -17,6 +17,8 @@ from io import StringIO
 import sys
 from openpyxl.styles import PatternFill, Font, Alignment
 import pickle
+import hashlib
+import hmac
 import os
 import time
 warnings.filterwarnings('ignore')
@@ -106,6 +108,8 @@ CACHE_DIR = SCRIPT_DIR / 'cache'  # Relative path: cache/
 CACHE_FILE = CACHE_DIR / 'vcp_scanner_cache.pkl'
 CACHE_LOCK_FILE = CACHE_DIR / '.cache_lock'  # File lock for multi-script safety
 CACHE_VERSION = 1  # Increment if cache format changes (detects incompatible caches)
+CACHE_SIG_FILE = CACHE_FILE.with_suffix('.pkl.sig')  # HMAC signature for cache integrity
+MAX_LOG_ENTRIES = 5000  # Cap master Excel log rows to prevent unbounded growth
 
 # Create cache directory if it doesn't exist
 if CACHE_ENABLED:
@@ -154,6 +158,40 @@ def _release_cache_lock(lock_file):
         except Exception:
             pass
 
+def _get_cache_key():
+    """Derive machine-specific key for cache integrity (prevents RCE via pickle tampering)."""
+    try:
+        uid = str(os.getuid()) if hasattr(os, 'getuid') else os.getenv('USERNAME', 'default')
+    except Exception:
+        uid = 'default'
+    key_material = f"{Path(__file__).resolve()}:{uid}"
+    return hashlib.sha256(key_material.encode()).digest()
+
+def _verify_cache_integrity():
+    """Verify cache HMAC before deserializing (mitigates pickle RCE attacks)."""
+    if not CACHE_SIG_FILE.exists():
+        return False
+    try:
+        with open(CACHE_FILE, 'rb') as f:
+            data = f.read()
+        with open(CACHE_SIG_FILE, 'r') as f:
+            stored_sig = f.read().strip()
+        expected_sig = hmac.new(_get_cache_key(), data, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(stored_sig, expected_sig)
+    except Exception:
+        return False
+
+def _sign_cache_file():
+    """Write HMAC signature after cache save (integrity seal)."""
+    try:
+        with open(CACHE_FILE, 'rb') as f:
+            data = f.read()
+        sig = hmac.new(_get_cache_key(), data, hashlib.sha256).hexdigest()
+        with open(CACHE_SIG_FILE, 'w') as f:
+            f.write(sig)
+    except Exception:
+        pass
+
 def is_cache_valid():
     """Check if cache exists and is fresh (not expired)."""
     if not CACHE_ENABLED or not CACHE_FILE.exists():
@@ -162,6 +200,11 @@ def is_cache_valid():
     # Check expiry
     cache_age_hours = (time.time() - os.path.getmtime(CACHE_FILE)) / 3600
     if cache_age_hours >= CACHE_EXPIRY_HOURS:
+        return False
+    
+    # Verify HMAC integrity before deserializing (security: prevents pickle RCE)
+    if not _verify_cache_integrity():
+        console.print("[yellow]\u26a0\ufe0f  Cache integrity check failed \u2014 rebuilding (unsigned or tampered)[/yellow]")
         return False
     
     # Check version compatibility (acquire lock to avoid reading partial writes)
@@ -182,8 +225,13 @@ def is_cache_valid():
     return True
 
 def load_cache():
-    """Load cached ticker data (thread-safe multi-script access)."""
+    """Load cached ticker data (thread-safe, HMAC-verified)."""
     if not CACHE_ENABLED or not CACHE_FILE.exists():
+        return {}
+    
+    # Security: verify HMAC before pickle.load to prevent RCE from tampered cache
+    if not _verify_cache_integrity():
+        console.print("[yellow]\u26a0\ufe0f  Cache signature invalid \u2014 ignoring cached data[/yellow]")
         return {}
     
     lock_file = _acquire_cache_lock(timeout=3)
@@ -231,6 +279,8 @@ def save_cache(data):
         
         # Atomic rename
         temp_file.replace(CACHE_FILE)
+        # Sign the cache file (HMAC integrity seal)
+        _sign_cache_file()
         console.print(f"[dim]✓ Cache saved ({len(data)} tickers, v{CACHE_VERSION})[/dim]")
     except Exception as e:
         console.print(f"[dim]Cache save warning: {e}[/dim]")
@@ -371,16 +421,22 @@ def fetch_china_stock_baostock(ticker, period_days=180):
 # BENCHMARK & RELATIVE STRENGTH
 # ============================================================================
 _benchmark_cache = {}
+_benchmark_lock = threading.Lock()  # Thread-safe benchmark cache access
+_ticker_cache_lock = threading.Lock()  # Thread-safe ticker cache access
 _benchmark_hist = None  # Global benchmark data, set before scanning
 
 def get_benchmark_data(symbol="SPY", period="1y"):
-    """Fetch and cache benchmark data for RS calculation"""
-    if symbol in _benchmark_cache:
-        return _benchmark_cache[symbol]
+    """Fetch and cache benchmark data for RS calculation (thread-safe)"""
+    # Thread-safe cache check
+    with _benchmark_lock:
+        if symbol in _benchmark_cache:
+            return _benchmark_cache[symbol]
+    # Fetch outside lock to allow concurrent network I/O
     try:
         data = yf.Ticker(symbol).history(period=period)
         if data is not None and not data.empty:
-            _benchmark_cache[symbol] = data
+            with _benchmark_lock:
+                _benchmark_cache[symbol] = data
             return data
     except Exception:
         pass
@@ -823,11 +879,14 @@ def analyze_ticker(ticker, ticker_cache=None):
     yf_succeeded = False
     stock = None
     
-    # Check cache first
-    if ticker_cache is not None and ticker in ticker_cache:
-        hist = ticker_cache[ticker]
-        yf_succeeded = True
-    else:
+    # Check cache first (thread-safe read)
+    if ticker_cache is not None:
+        with _ticker_cache_lock:
+            if ticker in ticker_cache:
+                hist = ticker_cache[ticker]
+                yf_succeeded = True
+    
+    if not yf_succeeded:
         # First try yfinance
         try:
             stock = yf.Ticker(ticker)
@@ -845,9 +904,10 @@ def analyze_ticker(ticker, ticker_cache=None):
         if hist is None and (ticker.endswith('.SS') or ticker.endswith('.SZ')):
             hist = fetch_china_stock_baostock(ticker)
         
-        # Cache the result if successful
+        # Cache the result if successful (thread-safe write)
         if hist is not None and ticker_cache is not None:
-            ticker_cache[ticker] = hist
+            with _ticker_cache_lock:
+                ticker_cache[ticker] = hist
     
     # If still no data, return error status
     if hist is None or hist.empty:
@@ -1415,6 +1475,10 @@ def save_vcp_to_master_log(df, report_folder):
             combined_df = pd.concat([existing_df, df_copy], ignore_index=True)
         else:
             combined_df = df_copy
+        
+        # Rotate log to prevent unbounded growth
+        if len(combined_df) > MAX_LOG_ENTRIES:
+            combined_df = combined_df.tail(MAX_LOG_ENTRIES)
         
         # Write to Excel with formatting
         with pd.ExcelWriter(master_log_path, engine='openpyxl') as writer:
