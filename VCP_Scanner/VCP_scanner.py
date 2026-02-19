@@ -17,10 +17,11 @@ from io import StringIO
 import sys
 from openpyxl.styles import PatternFill, Font, Alignment
 import pickle
-import hashlib
-import hmac
 import os
 import time
+import hmac
+import hashlib
+from html import escape as html_escape
 warnings.filterwarnings('ignore')
 
 # Cross-platform file locking (Windows vs Unix/Linux/macOS)
@@ -45,6 +46,15 @@ console = Console()
 # Thread lock for baostock (API is not thread-safe)
 baostock_lock = threading.Lock()
 
+# Thread lock for in-memory ticker cache (shared across ThreadPoolExecutor workers)
+_ticker_cache_lock = threading.Lock()
+
+# ============================================================================
+# VCP SCANNER VERSION & CHANGELOG
+# ============================================================================
+# Version: 1.1
+# Improvements:
+#   - Fixed ZigZag swing detection: only append final Low pivot, not High, to restore correct VCP detection for LRCX/NOC (prevents contraction pairing regression)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -98,7 +108,7 @@ LIQUIDITY_FILTER_ENABLED = True  # Set False to scan all tickers
 
 # Performance
 MAX_WORKERS = 10
-HISTORY_PERIOD = "6mo"
+HISTORY_PERIOD = "1y"   # Must cover RS_PERIOD_LONG (126 days) + LOOKBACK_PERIOD (100 days)
 
 # Cache Configuration (6-hour expiry, multi-script safe)
 CACHE_ENABLED = True
@@ -107,13 +117,26 @@ SCRIPT_DIR = Path(__file__).parent  # Script directory (portable, no hardcoded p
 CACHE_DIR = SCRIPT_DIR / 'cache'  # Relative path: cache/
 CACHE_FILE = CACHE_DIR / 'vcp_scanner_cache.pkl'
 CACHE_LOCK_FILE = CACHE_DIR / '.cache_lock'  # File lock for multi-script safety
-CACHE_VERSION = 1  # Increment if cache format changes (detects incompatible caches)
-CACHE_SIG_FILE = CACHE_FILE.with_suffix('.pkl.sig')  # HMAC signature for cache integrity
-MAX_LOG_ENTRIES = 5000  # Cap master Excel log rows to prevent unbounded growth
+CACHE_VERSION = 2  # Bump: v2 adds HMAC signature prefix to cache file
+CACHE_HMAC_KEY_FILE = CACHE_DIR / '.cache_hmac_key'  # HMAC key for cache integrity
 
 # Create cache directory if it doesn't exist
 if CACHE_ENABLED:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _get_cache_hmac_key():
+    """Get or create HMAC key for cache integrity verification.
+    Prevents loading tampered cache files (pickle deserialization RCE mitigation)."""
+    try:
+        if CACHE_HMAC_KEY_FILE.exists():
+            key = CACHE_HMAC_KEY_FILE.read_bytes()
+            if len(key) >= 32:
+                return key[:32]
+        key = os.urandom(32)
+        CACHE_HMAC_KEY_FILE.write_bytes(key)
+        return key
+    except Exception:
+        return None
 
 # ============================================================================
 # CACHE UTILITIES (Multi-script safe with file locking - cross-platform)
@@ -140,6 +163,8 @@ def _acquire_cache_lock(timeout=5):
                     return lock_file
                 except OSError:
                     time.sleep(0.1)
+        # Timed out — close the fd to avoid leaking file descriptors
+        lock_file.close()
         return None
     except Exception:
         return None
@@ -158,40 +183,6 @@ def _release_cache_lock(lock_file):
         except Exception:
             pass
 
-def _get_cache_key():
-    """Derive machine-specific key for cache integrity (prevents RCE via pickle tampering)."""
-    try:
-        uid = str(os.getuid()) if hasattr(os, 'getuid') else os.getenv('USERNAME', 'default')
-    except Exception:
-        uid = 'default'
-    key_material = f"{Path(__file__).resolve()}:{uid}"
-    return hashlib.sha256(key_material.encode()).digest()
-
-def _verify_cache_integrity():
-    """Verify cache HMAC before deserializing (mitigates pickle RCE attacks)."""
-    if not CACHE_SIG_FILE.exists():
-        return False
-    try:
-        with open(CACHE_FILE, 'rb') as f:
-            data = f.read()
-        with open(CACHE_SIG_FILE, 'r') as f:
-            stored_sig = f.read().strip()
-        expected_sig = hmac.new(_get_cache_key(), data, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(stored_sig, expected_sig)
-    except Exception:
-        return False
-
-def _sign_cache_file():
-    """Write HMAC signature after cache save (integrity seal)."""
-    try:
-        with open(CACHE_FILE, 'rb') as f:
-            data = f.read()
-        sig = hmac.new(_get_cache_key(), data, hashlib.sha256).hexdigest()
-        with open(CACHE_SIG_FILE, 'w') as f:
-            f.write(sig)
-    except Exception:
-        pass
-
 def is_cache_valid():
     """Check if cache exists and is fresh (not expired)."""
     if not CACHE_ENABLED or not CACHE_FILE.exists():
@@ -202,21 +193,28 @@ def is_cache_valid():
     if cache_age_hours >= CACHE_EXPIRY_HOURS:
         return False
     
-    # Verify HMAC integrity before deserializing (security: prevents pickle RCE)
-    if not _verify_cache_integrity():
-        console.print("[yellow]\u26a0\ufe0f  Cache integrity check failed \u2014 rebuilding (unsigned or tampered)[/yellow]")
-        return False
-    
     # Check version compatibility (acquire lock to avoid reading partial writes)
     lock_file = _acquire_cache_lock(timeout=3)
     try:
         with open(CACHE_FILE, 'rb') as f:
-            cache_data = pickle.load(f)
-            # If cache is a dict with 'version' key, validate it
-            if isinstance(cache_data, dict) and '__metadata__' in cache_data:
-                if cache_data['__metadata__'].get('version') != CACHE_VERSION:
-                    console.print(f"[dim]Cache version mismatch (found v{cache_data['__metadata__'].get('version')}, need v{CACHE_VERSION}) - rebuilding[/dim]")
-                    return False
+            raw = f.read()
+        # HMAC verification — reject tampered/corrupt cache (pickle RCE mitigation)
+        hmac_key = _get_cache_hmac_key()
+        if hmac_key and len(raw) > 32:
+            sig, data_bytes = raw[:32], raw[32:]
+            if not hmac.compare_digest(
+                hmac.new(hmac_key, data_bytes, hashlib.sha256).digest(), sig
+            ):
+                console.print("[dim]Cache integrity check failed - rebuilding[/dim]")
+                return False
+            cache_data = pickle.loads(data_bytes)
+        else:
+            return False  # No key or legacy unsigned cache
+        # Validate version
+        if isinstance(cache_data, dict) and '__metadata__' in cache_data:
+            if cache_data['__metadata__'].get('version') != CACHE_VERSION:
+                console.print(f"[dim]Cache version mismatch (found v{cache_data['__metadata__'].get('version')}, need v{CACHE_VERSION}) - rebuilding[/dim]")
+                return False
     except Exception:
         return False
     finally:
@@ -225,27 +223,32 @@ def is_cache_valid():
     return True
 
 def load_cache():
-    """Load cached ticker data (thread-safe, HMAC-verified)."""
+    """Load cached ticker data (thread-safe multi-script access)."""
     if not CACHE_ENABLED or not CACHE_FILE.exists():
-        return {}
-    
-    # Security: verify HMAC before pickle.load to prevent RCE from tampered cache
-    if not _verify_cache_integrity():
-        console.print("[yellow]\u26a0\ufe0f  Cache signature invalid \u2014 ignoring cached data[/yellow]")
         return {}
     
     lock_file = _acquire_cache_lock(timeout=3)
     try:
         with open(CACHE_FILE, 'rb') as f:
-            cache_data = pickle.load(f)
-            # Extract just the ticker data (exclude metadata)
-            if isinstance(cache_data, dict) and '__metadata__' in cache_data:
-                # New format with metadata
-                ticker_cache = {k: v for k, v in cache_data.items() if k != '__metadata__'}
-                return ticker_cache
-            else:
-                # Old format (direct ticker data)
-                return cache_data if cache_data else {}
+            raw = f.read()
+        # HMAC verification before unpickling (pickle RCE mitigation)
+        hmac_key = _get_cache_hmac_key()
+        if hmac_key and len(raw) > 32:
+            sig, data_bytes = raw[:32], raw[32:]
+            if not hmac.compare_digest(
+                hmac.new(hmac_key, data_bytes, hashlib.sha256).digest(), sig
+            ):
+                console.print("[dim]Cache integrity check failed - ignoring cache[/dim]")
+                return {}
+            cache_data = pickle.loads(data_bytes)
+        else:
+            return {}  # No key or legacy unsigned cache
+        # Extract just the ticker data (exclude metadata)
+        if isinstance(cache_data, dict) and '__metadata__' in cache_data:
+            ticker_cache = {k: v for k, v in cache_data.items() if k != '__metadata__'}
+            return ticker_cache
+        else:
+            return cache_data if cache_data else {}
     except Exception as e:
         console.print(f"[dim]Cache load warning: {e}[/dim]")
         return {}
@@ -274,13 +277,16 @@ def save_cache(data):
         
         # Write to temporary file first, then rename (atomic operation)
         temp_file = CACHE_FILE.with_suffix('.pkl.tmp')
+        data_bytes = pickle.dumps(cache_data)
+        # HMAC-sign the cache data (pickle RCE mitigation)
+        hmac_key = _get_cache_hmac_key()
+        sig = hmac.new(hmac_key, data_bytes, hashlib.sha256).digest() if hmac_key else b'\x00' * 32
         with open(temp_file, 'wb') as f:
-            pickle.dump(cache_data, f)
+            f.write(sig)
+            f.write(data_bytes)
         
         # Atomic rename
         temp_file.replace(CACHE_FILE)
-        # Sign the cache file (HMAC integrity seal)
-        _sign_cache_file()
         console.print(f"[dim]✓ Cache saved ({len(data)} tickers, v{CACHE_VERSION})[/dim]")
     except Exception as e:
         console.print(f"[dim]Cache save warning: {e}[/dim]")
@@ -329,23 +335,29 @@ def fetch_china_stock_baostock(ticker, period_days=180):
                 if lg.error_code != '0':
                     return None
                 
-                # Query historical data with forward-adjusted prices (adjustflag=2)
-                rs = bs.query_history_k_data_plus(
-                    bao_code,
-                    "date,code,open,high,low,close,volume",
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2"
-                )
-                
-                # Collect data
-                data_list = []
-                if rs.error_code == '0':
-                    while rs.next():
-                        data_list.append(rs.get_row_data())
-                
-                bs.logout()
+                # Always logout even if an exception occurs during query/processing
+                try:
+                    # Query historical data with forward-adjusted prices (adjustflag=2)
+                    rs = bs.query_history_k_data_plus(
+                        bao_code,
+                        "date,code,open,high,low,close,volume",
+                        start_date=start_date,
+                        end_date=end_date,
+                        frequency="d",
+                        adjustflag="2"
+                    )
+                    
+                    # Collect data
+                    data_list = []
+                    if rs.error_code == '0':
+                        while rs.next():
+                            data_list.append(rs.get_row_data())
+                finally:
+                    bs.logout()
+                    # Restore stderr early — data processing doesn't need suppression
+                    # (sys.stderr is process-global; minimizes window where other threads lose stderr)
+                    if sys.stderr is not old_stderr:
+                        sys.stderr = old_stderr
                 
                 if not data_list:
                     return None
@@ -410,7 +422,7 @@ def fetch_china_stock_baostock(ticker, period_days=180):
                 return df
                 
             finally:
-                # Restore stderr
+                # Safety fallback: ensure stderr is always restored
                 sys.stderr = old_stderr
         
         except Exception as e:
@@ -421,21 +433,18 @@ def fetch_china_stock_baostock(ticker, period_days=180):
 # BENCHMARK & RELATIVE STRENGTH
 # ============================================================================
 _benchmark_cache = {}
-_benchmark_lock = threading.Lock()  # Thread-safe benchmark cache access
-_ticker_cache_lock = threading.Lock()  # Thread-safe ticker cache access
+_benchmark_cache_lock = threading.Lock()  # Guards _benchmark_cache across thread pool workers
 _benchmark_hist = None  # Global benchmark data, set before scanning
 
 def get_benchmark_data(symbol="SPY", period="1y"):
     """Fetch and cache benchmark data for RS calculation (thread-safe)"""
-    # Thread-safe cache check
-    with _benchmark_lock:
+    with _benchmark_cache_lock:
         if symbol in _benchmark_cache:
             return _benchmark_cache[symbol]
-    # Fetch outside lock to allow concurrent network I/O
     try:
         data = yf.Ticker(symbol).history(period=period)
         if data is not None and not data.empty:
-            with _benchmark_lock:
+            with _benchmark_cache_lock:
                 _benchmark_cache[symbol] = data
             return data
     except Exception:
@@ -582,6 +591,16 @@ def find_swing_points(df, pct=None):
                 running_low = lows_arr[i]
                 running_low_idx = i
     
+    # ── Append final in-progress (unconfirmed) pivot — LOW only ──
+    # When the ZigZag ends in a downtrend, the running low IS the forming
+    # contraction bottom. Including it lets the scanner detect VCPs whose
+    # last pullback is still live.
+    # When the ZigZag ends in an uptrend, the running high is just "price is
+    # still rising" — appending it shifts the recent_highs sliding window by
+    # one position, destabilizing contraction pairing for no detection benefit.
+    if trend == -1 and running_low_idx >= scan_start:
+        pivots.append((running_low_idx, running_low, 'L'))
+
     # ── Convert to output format ──
     swing_highs = [{'index': idx, 'price': price, 'date': df.index[idx]}
                    for idx, price, ptype in pivots if ptype == 'H']
@@ -592,6 +611,8 @@ def find_swing_points(df, pct=None):
 
 def calculate_contraction_depth(high_val, low_val):
     """Calculate the depth of a price contraction"""
+    if high_val <= 0:
+        return 0.0  # Guard: avoid ZeroDivisionError on corrupt/zero-price data
     return ((high_val - low_val) / high_val) * 100
 
 def detect_vcp_pattern(df, rs_rating=None, rs_rating_long=None, zigzag_pct=None):
@@ -615,6 +636,14 @@ def detect_vcp_pattern(df, rs_rating=None, rs_rating_long=None, zigzag_pct=None)
     # Check trend
     last_close = df['Close'].iloc[-1]
     last_ma = df['MA'].iloc[-1]
+    # Guard: MA can be NaN (sparse data) or 0 (corrupt). Fail safe rather than ZeroDivisionError.
+    if pd.isna(last_ma) or last_ma <= 0:
+        return {
+            'is_vcp': False,
+            'reason': 'MA calculation invalid (insufficient or corrupt data)',
+            'contractions': 0,
+            'quality_score': 0
+        }
     price_above_ma_pct = ((last_close - last_ma) / last_ma) * 100
     in_uptrend = price_above_ma_pct >= MIN_PRICE_ABOVE_MA
     
@@ -643,16 +672,17 @@ def detect_vcp_pattern(df, rs_rating=None, rs_rating_long=None, zigzag_pct=None)
     # Check for progressive contractions + measure volume per contraction
     contractions = []
     contraction_volumes = []  # Average volume during each contraction period
+
     recent_highs = highs[-min(MAX_CONTRACTIONS + 1, len(highs)):]
     recent_lows = lows[-min(MAX_CONTRACTIONS, len(lows)):]
-    
+
     for i in range(min(len(recent_highs) - 1, len(recent_lows))):
         high_price = recent_highs[i]['price']
         low_price = recent_lows[i]['price']
         depth = calculate_contraction_depth(high_price, low_price)
         contractions.append(depth)
-        
-        # Average volume during this contraction period (high → low)
+
+        # Average volume during this contraction period (high → nearest low)
         h_idx = recent_highs[i]['index']
         l_idx = recent_lows[i]['index']
         start, end = min(h_idx, l_idx), max(h_idx, l_idx)
@@ -741,6 +771,9 @@ def detect_vcp_pattern(df, rs_rating=None, rs_rating_long=None, zigzag_pct=None)
     # Check volume pattern (both overall AND per-contraction)
     recent_vol_avg = df['Volume'].tail(10).mean()
     avg_volume = df['Volume_MA'].iloc[-1]
+    # Guard: rolling MA can be NaN if data is sparse — fall back to direct mean
+    if pd.isna(avg_volume) or avg_volume == 0:
+        avg_volume = df['Volume'].tail(VOLUME_MA_PERIOD).mean()
     volume_decreasing = recent_vol_avg < avg_volume
     
     # Per-contraction volume: volume should dry up in each successive pullback
@@ -765,7 +798,10 @@ def detect_vcp_pattern(df, rs_rating=None, rs_rating_long=None, zigzag_pct=None)
     is_breakout = False
     for day_offset in range(1, min(BREAKOUT_LOOKBACK_DAYS + 1, len(df))):
         close_today = df['Close'].iloc[-day_offset]
-        close_prev = df['Close'].iloc[-day_offset - 1] if day_offset + 1 <= len(df) else 0
+        # Guard: if there's no prior bar, we cannot confirm a cross — skip rather than default to 0
+        if day_offset + 1 > len(df):
+            break
+        close_prev = df['Close'].iloc[-day_offset - 1]
         if close_today > pivot_high and close_prev <= pivot_high:
             is_breakout = True
             break
@@ -882,11 +918,11 @@ def analyze_ticker(ticker, ticker_cache=None):
     # Check cache first (thread-safe read)
     if ticker_cache is not None:
         with _ticker_cache_lock:
-            if ticker in ticker_cache:
-                hist = ticker_cache[ticker]
-                yf_succeeded = True
-    
-    if not yf_succeeded:
+            hist = ticker_cache.get(ticker)
+        if hist is not None:
+            yf_succeeded = True  # cache hit; stock obj remains None (guarded below)
+
+    if hist is None:
         # First try yfinance
         try:
             stock = yf.Ticker(ticker)
@@ -1066,12 +1102,39 @@ def scan_watchlist(tickers, ticker_cache=None):
             futures = {executor.submit(analyze_ticker, ticker, ticker_cache): ticker for ticker in valid_tickers}
             
             for future in as_completed(futures):
-                result = future.result()
+                ticker_name = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    # Gracefully handle any unhandled exception in analyze_ticker
+                    result = {
+                        'Ticker': ticker_name,
+                        'Status': 'ERROR',
+                        'VCP': False,
+                        'Quality': 0,
+                        'Contractions': 0,
+                        'Details': f'Analysis error: {type(e).__name__}'
+                    }
                 data.append(result)
                 progress.advance(task)
     
     # Convert to DataFrame
     df = pd.DataFrame(data)
+    
+    # Fill missing columns with safe defaults (early-exit tickers lack full column set)
+    _col_defaults = [
+        ('Breakout', False), ('Name', 'N/A'), ('VCP', False),
+        ('Quality', 0), ('Sustained Volume', False),
+        ('RS Rating', 0), ('RS Rating Long', 0),
+        ('Price Above MA', 0), ('Distance to Pivot', 0),
+        ('Current Price', 0), ('Pivot Price', 0),
+        ('Benchmark', RS_BENCHMARK), ('Volume Spike', False),
+    ]
+    for col, default in _col_defaults:
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = df[col].fillna(default)
     
     # Sort: Breakouts first, then by quality score
     df['Breakout_rank'] = df['Breakout'].map({True: 2, False: 0})
@@ -1382,8 +1445,8 @@ def save_vcp_to_html(df, filepath, prime_tickers=None):
 """
         
         for _, row in df.iterrows():
-            ticker = str(row['Ticker'])[:12]
-            name = str(row['Name'])[:40]
+            ticker = html_escape(str(row['Ticker'])[:12])
+            name = html_escape(str(row['Name'])[:40])
             status = str(row['Status'])
             
             # Format status with color
@@ -1400,7 +1463,7 @@ def save_vcp_to_html(df, filepath, prime_tickers=None):
             contractions = str(row['Contractions'])
             rs_val = row.get('RS Rating', 0)
             rs_long_val = row.get('RS Rating Long', 0)
-            bm_label = str(row.get('Benchmark', 'SPY')).lstrip('^') if 'Benchmark' in df.columns else 'SPY'
+            bm_label = html_escape(str(row.get('Benchmark', 'SPY')).lstrip('^')) if 'Benchmark' in df.columns else 'SPY'
             rs_html = f"+{rs_val:.1f}% vs {bm_label}" if rs_val > 0 else f"{rs_val:.1f}% vs {bm_label}"
             rs_long_html = f"+{rs_long_val:.1f}% vs {bm_label}" if rs_long_val > 0 else f"{rs_long_val:.1f}% vs {bm_label}"
             price_ma = f"+{row['Price Above MA']:.1f}%" if row['Price Above MA'] > 0 else f"{row['Price Above MA']:.1f}%"
@@ -1435,8 +1498,11 @@ def save_vcp_to_html(df, filepath, prime_tickers=None):
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
-        # Show relative path for sharing
-        rel_path = Path(filepath).relative_to(SCRIPT_DIR) if Path(filepath).is_relative_to(SCRIPT_DIR) else Path(filepath).name
+        # Show relative path for sharing (is_relative_to requires Python 3.9+; use try/except for 3.8 compat)
+        try:
+            rel_path = Path(filepath).relative_to(SCRIPT_DIR)
+        except ValueError:
+            rel_path = Path(filepath)
         console.print(f"[green]✅ HTML report saved to ./Report/{rel_path.name}[/green]")
     except Exception as e:
         console.print(f"[red]Error saving HTML:[/red]")
@@ -1475,10 +1541,6 @@ def save_vcp_to_master_log(df, report_folder):
             combined_df = pd.concat([existing_df, df_copy], ignore_index=True)
         else:
             combined_df = df_copy
-        
-        # Rotate log to prevent unbounded growth
-        if len(combined_df) > MAX_LOG_ENTRIES:
-            combined_df = combined_df.tail(MAX_LOG_ENTRIES)
         
         # Write to Excel with formatting
         with pd.ExcelWriter(master_log_path, engine='openpyxl') as writer:
@@ -1519,6 +1581,9 @@ def save_vcp_to_master_log(df, report_folder):
 
 def load_watchlist_from_json(config_file='watchlists.json'):
     """Load tickers from existing watchlist JSON"""
+    # Always look in json folder unless absolute path
+    if not os.path.isabs(config_file) and not config_file.startswith('json/'):
+        config_file = f"json/{config_file}"
     try:
         # Resolve relative to script directory so it works regardless of CWD
         config_path = Path(config_file)
@@ -1559,24 +1624,24 @@ if __name__ == "__main__":
     
     # Choose watchlist
     console.print("\n[bold cyan]Select watchlist to scan:[/bold cyan]")
-    console.print("  1. Tech Sector (Global Tech Stocks)")
-    console.print("  2. US Markets (S&P 500 + Nasdaq-100, ~508 tickers)")
-    console.print("  3. Japan MSCI (MSCI Japan, 180 tickers)")
-    console.print("  4. Hong Kong (HSI + HSTECH Combined, 103 tickers)")
+    console.print("  1. watchlists.json (default)")
+    console.print("  2. spx_qqq.json (S&P 500 + Nasdaq-100, ~508 tickers)")
+    console.print("  3. Japan_MSCI.json (MSCI Japan, 180 tickers)")
+    console.print("  4. HSI_HSTECH.json (Hong Kong Combined, 103 unique tickers)")
     choice = input("\nEnter choice (1-4) [default: 1]: ").strip() or "1"
     
     if choice == "2":
-        watchlist_file = 'watchlists/us_stocks.json'
-        console.print(f"[cyan]→ Using {watchlist_file} (SPX + QQQ)[/cyan]")
+        watchlist_file = 'json/spyqqq.json'
+        console.print(f"[cyan]→ Using {watchlist_file} (SPY + QQQ)[/cyan]")
     elif choice == "3":
-        watchlist_file = 'watchlists/japan_stocks.json'
+        watchlist_file = 'json/Japan_MSCI.json'
         console.print(f"[cyan]→ Using {watchlist_file} (MSCI Japan, 180 tickers)[/cyan]")
     elif choice == "4":
-        watchlist_file = 'watchlists/hk_stocks.json'
-        console.print(f"[cyan]→ Using {watchlist_file} (Hong Kong HSI + HSTECH, 103 tickers)[/cyan]")
+        watchlist_file = 'json/HSI_HSTECH.json'
+        console.print(f"[cyan]→ Using {watchlist_file} (Hong Kong Index + Tech Combined, 103 tickers)[/cyan]")
     else:
-        watchlist_file = 'watchlists/tech_sector.json'
-        console.print(f"[cyan]→ Using {watchlist_file} (Global Tech Stocks)[/cyan]")
+        watchlist_file = 'json/watchlists.json'
+        console.print(f"[cyan]→ Using {watchlist_file} (default)[/cyan]")
     
     # Load watchlist from JSON
     tickers = load_watchlist_from_json(watchlist_file)
